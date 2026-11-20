@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>浮点图像交换面板 · Floating-Point Exchange Panel</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2127; --line: #2c313a; --fg: #d7dce3;
+    --muted: #8b93a1; --accent: #4ea1ff; --warn: #ff5050; --ok: #3ecf8e;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 13px/1.5 -apple-system, "Segoe UI", Roboto, "PingFang SC", sans-serif;
+         background:var(--bg); color:var(--fg); display:flex; flex-direction:column; height:100vh; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .sub { color:var(--muted); font-size:12px; }
+  main { flex:1; display:flex; min-height:0; }
+  .sidebar { width:340px; overflow-y:auto; padding:14px; border-right:1px solid var(--line); background:var(--panel); }
+  .stage { flex:1; overflow:auto; padding:18px; display:flex; flex-direction:column; gap:14px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:14px; }
+  section h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 10px; }
+  .row { display:flex; gap:8px; align-items:center; margin:6px 0; flex-wrap:wrap; }
+  label { color:var(--muted); }
+  select, button, input[type=range] { font:inherit; }
+  select, button { background:#242932; color:var(--fg); border:1px solid var(--line);
+                   border-radius:6px; padding:5px 9px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#0b1220; border-color:var(--accent); font-weight:600; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .seg { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .seg button { border:0; border-radius:0; background:#242932; }
+  .seg button.active { background:var(--accent); color:#0b1220; font-weight:600; }
+  .canvas-wrap { position:relative; background:
+     repeating-conic-gradient(#2a2f38 0% 25%, #22262d 0% 50%) 0 0/16px 16px;
+     border:1px solid var(--line); border-radius:8px; padding:8px; overflow:auto; max-width:100%; }
+  canvas { image-rendering: pixelated; display:block; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; }
+  .pill.f16 { background:#3a2e1a; color:#ffcf6b; }
+  .pill.f32 { background:#16352a; color:#5fe0a8; }
+  .pill.sem { background:#26303f; color:#9fc1ff; }
+  .legend { display:flex; gap:12px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:8px; }
+  .swatch { display:inline-block; width:11px; height:11px; border-radius:2px; margin-right:4px; vertical-align:-1px; border:1px solid #0006; }
+  .metric { font-variant-numeric: tabular-nums; }
+  .ok { color:var(--ok); } .bad { color:var(--warn); }
+  #tooltip { position:fixed; pointer-events:none; background:#0d1014ee; border:1px solid var(--line);
+             border-radius:6px; padding:8px 10px; font-size:11px; display:none; z-index:10; max-width:280px; }
+  .log { font-family:ui-monospace,monospace; font-size:11px; max-height:240px; overflow:auto;
+         background:#101318; border:1px solid var(--line); border-radius:6px; padding:8px; white-space:pre-wrap; }
+  .muted { color:var(--muted); }
+  input[type=range]{ width:130px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 10px; }
+  code { background:#101318; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>浮点图像交换面板</h1>
+  <span class="sub">OpenEXR ⇄ FIM · 负原点数据窗 · 覆盖掩码 · half/float 精度切换</span>
+  <span style="flex:1"></span>
+  <button id="btn-acceptance" class="primary">运行程序化验收</button>
+</header>
+
+<main>
+  <div class="sidebar">
+    <section>
+      <h2>素材与窗口</h2>
+      <div id="plates"></div>
+    </section>
+
+    <section>
+      <h2>预览控制</h2>
+      <div class="row">
+        <label>目标</label>
+        <div class="seg" id="seg-target">
+          <button data-v="composite" class="active">拼接结果</button>
+          <button data-v="plate_a.exr">板 A</button>
+          <button data-v="plate_b.exr">板 B</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>精度预览</label>
+        <div class="seg" id="seg-precision">
+          <button data-v="FLOAT32" class="active">单精度 float32</button>
+          <button data-v="FLOAT16">半精度 float16</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>通道视图</label>
+        <div class="seg" id="seg-mode">
+          <button data-v="color" class="active">颜色（显示映射）</button>
+          <button data-v="Z">深度 Z</button>
+          <button data-v="customHeat">未知 customHeat</button>
+        </div>
+      </div>
+      <div class="muted" style="margin:8px 0 4px">颜色通道独立显示映射（仅影响预览，不改数据）</div>
+      <div id="exposure-controls"></div>
+    </section>
+
+    <section>
+      <h2>导出 FIM（可回读浮点表示）</h2>
+      <div class="row">
+        <label>精度</label>
+        <div class="seg" id="seg-export-precision">
+          <button data-v="FLOAT32" class="active">float32</button>
+          <button data-v="FLOAT16">float16</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>保真表示</label>
+        <div class="seg" id="seg-representation">
+          <button data-v="both" class="active">两种都导出</button>
+          <button data-v="sparse">稀疏窗口</button>
+          <button data-v="full">全幅+有效域</button>
+        </div>
+      </div>
+      <div class="row">
+        <button id="btn-export" class="primary">导出并回读校验</button>
+        <button id="btn-reopen">重新打开已导出文件</button>
+      </div>
+      <div class="row" id="download-row"></div>
+    </section>
+
+    <section>
+      <h2>验收结果</h2>
+      <div id="acceptance-summary" class="muted">点击右上角按钮运行 43 项断言。</div>
+      <div class="log" id="acceptance-log" style="display:none;margin-top:8px"></div>
+    </section>
+  </div>
+
+  <div class="stage">
+    <section>
+      <h2>预览 <span class="muted" id="preview-meta"></span></h2>
+      <div class="canvas-wrap"><canvas id="canvas"></canvas></div>
+      <div class="legend">
+        <span><span class="swatch" style="background:#f0f"></span>NaN 非数</span>
+        <span><span class="swatch" style="background:#ff5000"></span>±Inf 无穷</span>
+        <span><span class="swatch" style="background:#ff0"></span>超出 half 范围（溢出）</span>
+        <span><span class="swatch" style="background:
+          repeating-conic-gradient(#444 0 25%, #222 0 50%) 0 0/8px 8px"></span>缺采样（透明，棋盘格）</span>
+        <span><span class="swatch" style="background:#000;border-color:#555"></span>真实黑像素（不透明）</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>导出 / 回读量化与异常处置</h2>
+      <div id="export-report" class="muted">尚未导出。</div>
+    </section>
+  </div>
+</main>
+
+<div id="tooltip"></div>
+<script src="/app.js"></script>
+</body>
+</html>
