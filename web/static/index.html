@@ -124,8 +124,40 @@
     </section>
 
     <section>
+      <h2>景深遮挡与分层检查</h2>
+      <div class="row">
+        <button id="btn-depth">加载前景/背景深度并合成</button>
+        <button id="btn-legacy">运行旧工程回归</button>
+      </div>
+      <div class="row">
+        <label>世界像素</label>
+        <input id="inspect-x" type="number" value="-10" style="width:64px">
+        <input id="inspect-y" type="number" value="0" style="width:56px">
+        <button id="btn-inspect">检查各通道</button>
+      </div>
+      <div class="row">
+        <label>目标</label>
+        <div class="seg" id="seg-inspect-target">
+          <button data-v="depth" class="active">景深合成</button>
+          <button data-v="fg">前景板</button>
+          <button data-v="bg">背景板</button>
+        </div>
+      </div>
+      <div class="row">
+        <button id="btn-edit">前景局部编辑</button>
+        <button id="btn-undo">撤销</button>
+        <button id="btn-crop">裁切前景窗口</button>
+      </div>
+      <div class="row">
+        <button id="btn-order-swap">交换前景自定义通道存储顺序</button>
+      </div>
+      <div id="depth-report" class="muted" style="margin-top:8px">尚未加载分层数据。</div>
+      <div id="inspect-report" class="log" style="display:none;margin-top:8px"></div>
+    </section>
+
+    <section>
       <h2>验收结果</h2>
-      <div id="acceptance-summary" class="muted">点击右上角按钮运行 43 项断言。</div>
+      <div id="acceptance-summary" class="muted">点击右上角按钮运行全部断言。</div>
       <div class="log" id="acceptance-log" style="display:none;margin-top:8px"></div>
     </section>
   </div>

@@ -19,11 +19,16 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from float_panel import (  # noqa: E402
-    FLOAT16, FLOAT32, read_exr, read_fim, stitch, verify_fim_roundtrip, write_fim,
+    FLOAT16, FLOAT32,
+    DeferredExrRead, WindowMismatchError, assert_window_coherent,
+    read_exr, read_fim, stitch, verify_fim_roundtrip, write_fim,
 )
 from float_panel.display import render_rgba, sample_tooltip  # noqa: E402
+from float_panel.edit import crop_image, edit_foreground_region  # noqa: E402
 from float_panel.fim_io import STATUS_INF, STATUS_NAN, STATUS_OVERFLOW  # noqa: E402
-from float_panel.synth import write_plates  # noqa: E402
+from float_panel.layers import composite_layers  # noqa: E402
+from float_panel.sampling import sample_all  # noqa: E402
+from float_panel.synth import write_depth_plates, write_plates  # noqa: E402
 
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_LOCK = threading.Lock()
@@ -33,6 +38,12 @@ STATE: dict = {
     "composite": None,
     "owner": None,
     "last_export": None,  # dict with paths, stats, reports
+    "depth_fg": None,
+    "depth_bg": None,
+    "depth_composite": None,
+    "depth_provenance": None,
+    "deferred": None,     # paused DeferredExrRead snapshot
+    "edits": {},          # name -> UndoStack for the depth composite
 }
 WORK_DIR = os.path.join(os.path.dirname(WEB_DIR), "work")
 
@@ -46,6 +57,20 @@ def _ensure_assets():
     marker = os.path.join(WORK_DIR, "plate_a.exr")
     if not os.path.exists(marker):
         write_plates(WORK_DIR)
+    if not os.path.exists(os.path.join(WORK_DIR, "depth_fg.exr")):
+        write_depth_plates(WORK_DIR)
+
+
+def _load_depth_layers():
+    fg = read_exr(os.path.join(WORK_DIR, "depth_fg.exr"))
+    bg = read_exr(os.path.join(WORK_DIR, "depth_bg.exr"))
+    composite, provenance = composite_layers([fg, bg])
+    with STATE_LOCK:
+        STATE["depth_fg"] = fg
+        STATE["depth_bg"] = bg
+        STATE["depth_composite"] = composite
+        STATE["depth_provenance"] = provenance
+    return composite
 
 
 def _load_plates():
@@ -129,6 +154,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._handle_download()
             if path == "/api/acceptance":
                 return self._handle_acceptance()
+            if path == "/api/inspect":
+                return self._handle_inspect()
+            if path == "/api/deferred":
+                return self._handle_deferred()
+            if path == "/api/depth":
+                return self._handle_depth()
+            if path == "/api/edit":
+                return self._handle_edit()
+            if path == "/api/legacy":
+                return self._handle_legacy()
+            if path == "/api/order":
+                return self._handle_order()
             return self._serve_static(path)
         except Exception as exc:  # surface errors to the panel
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
@@ -245,6 +282,160 @@ class Handler(BaseHTTPRequestHandler):
         report = run_acceptance(WORK_DIR)
         self._send_json(report)
 
+    # -- inspection: trace every channel from one world pixel ---------------
+    def _handle_inspect(self):
+        q = self._query()
+        x, y = int(q.get("x", 0)), int(q.get("y", 0))
+        target = q.get("target", "depth")
+        table = {
+            "depth": lambda: STATE["depth_composite"] or _load_depth_layers(),
+            "composite": lambda: STATE["composite"] or _load_plates(),
+            "fg": lambda: STATE["depth_fg"],
+            "bg": lambda: STATE["depth_bg"],
+        }
+        src = table.get(target, table["depth"])()
+        if src is None:
+            return self._send_json({"error": "target not loaded"}, 404)
+        self._send_json({
+            "target": target,
+            "sample": sample_tooltip(src, x, y),
+            "channels": sample_all(src, x, y) if src.contains(x, y) else {},
+        })
+
+    # -- deferred EXR read: pause before crop, complete later ---------------
+    def _handle_deferred(self):
+        q = self._query()
+        stage = q.get("stage", "pause")
+        if stage == "pause":
+            reader = DeferredExrRead(os.path.join(WORK_DIR, "plate_a.exr"))
+            STATE["deferred"] = reader
+            snapshot = reader.pause_before_crop()
+            fresh = read_exr(os.path.join(WORK_DIR, "plate_a.exr"))
+            coherent = True
+            try:
+                assert_window_coherent(reader.window_token, fresh)
+            except WindowMismatchError:
+                coherent = False
+            return self._send_json({
+                "stage": "paused",
+                "snapshot": snapshot,
+                # A freshly loaded plate has its own token; pairing the paused
+                # (old) window with these (new) samples would be incoherent.
+                "fresh_token": fresh.window_token,
+                "old_and_new_coherent": coherent,
+            })
+        if stage == "finish":
+            reader = STATE.get("deferred")
+            if reader is None:
+                return self._send_json({"error": "pause first"}, 400)
+            image = reader.finish()
+            fresh = read_exr(os.path.join(WORK_DIR, "plate_a.exr"))
+            return self._send_json({
+                "stage": "finished",
+                "data_window": list(image.data_window),
+                "window_token": image.window_token,
+                "fresh_token": fresh.window_token,
+                "tokens_distinct": image.window_token != fresh.window_token,
+                "samples_match_fresh": all(
+                    np.array_equal(image.channels[n].data, fresh.channels[n].data, equal_nan=True)
+                    for n in image.channels
+                ),
+                "origin_from_paused_window": [image.x_origin, image.y_origin],
+            })
+        return self._send_json({"error": "unknown stage"}, 400)
+
+    # -- descriptor-driven depth occlusion ----------------------------------
+    def _handle_depth(self):
+        image = STATE["depth_composite"] or _load_depth_layers()
+        self._send_json({
+            "summary": image.summary(),
+            "provenance": {
+                k: (v if not isinstance(v, np.ndarray) else {"shape": list(v.shape)})
+                for k, v in STATE["depth_provenance"].items()
+            },
+            "depth_sources": [n for n, ch in image.channels.items()
+                              if ch.semantic.value == "depth"],
+            "passthrough": [n for n, ch in image.channels.items() if ch.passthrough],
+        })
+
+    # -- localized regional edit + undo on the foreground layer -------------
+    def _handle_edit(self):
+        q = self._query()
+        action = q.get("action", "apply")
+        if STATE["depth_fg"] is None:
+            _load_depth_layers()
+        # Edits target the foreground layer, whose channels carry the fg role;
+        # a background pixel with the same suffix must never be touched.
+        image = STATE["depth_fg"]
+        if action == "apply":
+            x, y = int(q.get("x", 0)), int(q.get("y", 0))
+            size = int(q.get("size", 4))
+            value = float(q.get("value", 1.5))
+            base = q.get("base", "Z")
+            rect = (x, y, x + size - 1, y + size - 1)
+            changed, undo = edit_foreground_region(image, rect, value, base)
+            STATE["edits"]["undo_stack"] = undo
+            self._send_json({"action": "apply", "rect": list(rect), "changed": changed,
+                             "undo_depth": undo.depth})
+        elif action == "undo":
+            undo = STATE["edits"].get("undo_stack")
+            if undo is None:
+                return self._send_json({"error": "nothing to undo"}, 400)
+            undo.undo()
+            self._send_json({"action": "undo", "undo_depth": undo.depth})
+        elif action == "crop":
+            x0, y0, x1, y1 = (int(v) for v in (q.get("x0", 0), q.get("y0", 0),
+                                               q.get("x1", 1), q.get("y1", 1)))
+            cropped = crop_image(image, (x0, y0, x1, y1))
+            STATE["depth_fg"] = cropped
+            STATE["edits"].clear()
+            self._send_json({"action": "crop", "data_window": list(cropped.data_window),
+                             "shape": [cropped.height, cropped.width]})
+        else:
+            self._send_json({"error": "unknown action"}, 400)
+
+    # -- legacy project: same-suffix fg/bg channels in a negative window ----
+    def _handle_legacy(self):
+        from tests.acceptance import legacy_project_scenario
+        report = legacy_project_scenario(WORK_DIR)
+        self._send_json(report)
+
+    # -- reorder channel storage in the FIM file ----------------------------
+    def _handle_order(self):
+        q = self._query()
+        order = [n for n in q.get("channels", "").split(",") if n]
+        action = q.get("action", "")
+        image = STATE["depth_composite"] or _load_depth_layers()
+        if action == "swap":
+            # Swap the foreground custom channel ahead of the depth component.
+            current = image.channel_names()
+            custom = next((n for n in current if n.endswith(".custom")), None)
+            depth = next((n for n, c in image.channels.items() if c.semantic.value == "depth"), None)
+            if custom and depth:
+                order = [n for n in current if n != custom]
+                order.insert(current.index(depth), custom)
+            image = image.clone(new_token=False)
+            image.reorder_channels(order)
+            STATE["depth_composite"] = image
+        precision = FLOAT16 if q.get("precision") == FLOAT16 else FLOAT32
+        path = os.path.join(WORK_DIR, "export_ordered.fim")
+        if not order:
+            order = list(reversed(image.channel_names()))
+        stats = write_fim(path, image, precision, full_frame=False, channel_order=order)
+        reopened, _, meta = read_fim(path)
+        # Verify logical identity survives: compare by channel name, not order.
+        values = {}
+        for name, ch in image.channels.items():
+            values[name] = bool(np.array_equal(ch.data, reopened.channels[name].data,
+                                               equal_nan=True))
+        self._send_json({
+            "requested_order": order,
+            "stored_order": meta["channel_order"],
+            "order_preserved": meta["channel_order"] == order,
+            "logical_values_match": values,
+            "download": os.path.basename(path),
+        })
+
     def _serve_static(self, path):
         if path == "/":
             path = "/index.html"
@@ -260,6 +451,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     _ensure_assets()
     _load_plates()
+    _load_depth_layers()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"float panel on http://127.0.0.1:{port}")

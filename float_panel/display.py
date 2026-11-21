@@ -5,6 +5,10 @@ in the data itself, only for preview). Depth and unknown channels are rendered a
 false-color with raw numeric readouts, preserving numeric meaning. Non-finite and
 overflowing samples get explicit, distinguishable preview colors instead of being
 silently clamped to black or white.
+
+Channel roles/semantics are read from the descriptor, so a custom channel that
+merely looks like a colour component is still treated as pass-through unless
+the parser actually classified it as colour.
 """
 
 from __future__ import annotations
@@ -13,8 +17,8 @@ import numpy as np
 
 from .fim_io import STATUS_INF, STATUS_NAN, STATUS_OVERFLOW
 from .model import Semantic
+from .sampling import sample_all
 
-# Preview sRGB colors for exceptional samples.
 COLOR_NAN = (255, 0, 255)      # magenta
 COLOR_INF = (255, 80, 0)       # orange
 COLOR_OVERFLOW = (255, 255, 0) # yellow
@@ -65,7 +69,6 @@ def render_rgba(
         safe = np.where(np.isfinite(rgb), rgb, 0.0)
         rgba[..., :3] = (np.clip(safe, 0, 1) * 255).astype(np.uint8)
     else:
-        # Depth or selected unknown channel: false color from finite range.
         target = mode if mode in channel_arrays else (depth_names[0] if depth_names else next(iter(channel_arrays)))
         values = channel_arrays[target].astype(np.float32)
         finite = np.isfinite(values) & coverage
@@ -73,7 +76,6 @@ def render_rgba(
         hi = float(values[finite].max()) if finite.any() else 1.0
         rgba[..., :3] = _false_color(values, finite, lo, hi)
 
-    # Exceptional status overrides the mapped color so it is visible.
     nan_mask = (any_status & STATUS_NAN).astype(bool)
     inf_mask = (any_status & STATUS_INF).astype(bool)
     overflow_mask = ((any_status & STATUS_OVERFLOW)
@@ -82,29 +84,44 @@ def render_rgba(
     rgba[inf_mask, :3] = COLOR_INF
     rgba[overflow_mask, :3] = COLOR_OVERFLOW
 
-    # Alpha encodes coverage: real black stays opaque, missing stays transparent.
     rgba[..., 3] = np.where(coverage, 255, 0).astype(np.uint8)
     return rgba
 
 
 def sample_tooltip(image, world_x: int, world_y: int) -> dict:
-    """Raw numeric values at a world coordinate (depth/unknown keep meaning)."""
+    """Raw numeric values at a world coordinate, resolved through descriptors.
+
+    Values are looked up on each channel's own grid, so a strided or
+    layer-offset channel reports what actually exists at that world point.
+    """
     if not image.contains(world_x, world_y):
         return {"inside": False}
+    sampled = sample_all(image, world_x, world_y)
+    values = {}
+    for name, s in sampled.items():
+        v = s["value"]
+        if v is None:
+            shown = "—"
+        elif isinstance(v, float) and not np.isfinite(v):
+            shown = "nan" if np.isnan(v) else ("+inf" if v > 0 else "-inf")
+        else:
+            shown = v
+        values[name] = {
+            "value": shown,
+            "present": s["present"],
+            "on_grid": s["on_grid"],
+            "source_name": s["source_name"],
+            "semantic": s["semantic"],
+            "role": s["role"],
+            "passthrough": s["passthrough"],
+        }
     row, col = image.pixel_index(world_x, world_y)
     covered = bool(image.coverage[row, col])
-    values = {}
-    for name, ch in image.channels.items():
-        v = ch.data[row, col]
-        values[name] = {
-            "value": float(v) if np.isfinite(v) else ("nan" if np.isnan(v) else ("+inf" if v > 0 else "-inf")),
-            "dtype": ch.dtype,
-            "semantic": ch.semantic.value,
-        }
     return {
         "inside": True,
         "world": [world_x, world_y],
         "covered": covered,
+        "window_token": image.window_token,
         "note": "real sample (value may be exactly zero)" if covered else "missing sample",
         "channels": values,
     }

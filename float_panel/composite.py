@@ -9,23 +9,21 @@ from __future__ import annotations
 
 import numpy as np
 
-from .model import UINT32, FloatImage
+from .model import UINT32, Channel, ChannelDescriptor, FloatImage, window_union
 
 
 def union_display_window(images: list[FloatImage]) -> tuple[int, int, int, int]:
-    x0 = min(img.display_window[0] for img in images)
-    y0 = min(img.display_window[1] for img in images)
-    x1 = max(img.display_window[2] for img in images)
-    y1 = max(img.display_window[3] for img in images)
-    return x0, y0, x1, y1
+    result = images[0].display_window
+    for img in images[1:]:
+        result = window_union(result, img.display_window)
+    return result
 
 
 def union_data_window(images: list[FloatImage]) -> tuple[int, int, int, int]:
-    x0 = min(img.data_window[0] for img in images)
-    y0 = min(img.data_window[1] for img in images)
-    x1 = max(img.data_window[2] for img in images)
-    y1 = max(img.data_window[3] for img in images)
-    return x0, y0, x1, y1
+    result = images[0].data_window
+    for img in images[1:]:
+        result = window_union(result, img.data_window)
+    return result
 
 
 def stitch(images: list[FloatImage]) -> tuple[FloatImage, np.ndarray]:
@@ -85,24 +83,30 @@ def stitch(images: list[FloatImage]) -> tuple[FloatImage, np.ndarray]:
         unowned = img.coverage & (owner[region] == 0)
         owner[region] = np.where(unowned, idx, owner[region])
 
-    channels = {
-        name: type(images[0].channels[name])(
+    channels = {}
+    for name in channel_names:
+        ch0 = images[0].channels[name]
+        dtype = ch0.dtype
+        cast = (np.uint32 if dtype == UINT32
+                else np.float16 if dtype == "FLOAT16" else np.float32)
+        channels[name] = Channel(
             name=name,
-            dtype=dtypes[name],
-            data=accum[name].astype(
-                np.uint32 if dtypes[name] == UINT32
-                else np.float16 if dtypes[name] == "FLOAT16"
-                else np.float32
+            dtype=dtype,
+            data=accum[name].astype(cast),
+            descriptor=ChannelDescriptor(
+                name=name,
+                source_name=ch0.descriptor.source_name,
+                sample_step=(1, 1),
+                window_origin=(x0, y0),
             ),
         )
-        for name in channel_names
-    }
     composite = FloatImage(
         name="stitch",
         display_window=union_display_window(images),
         data_window=(x0, y0, x1, y1),
         channels=channels,
         coverage=coverage,
+        lineage=tuple(tok for img in images for tok in (img.lineage or (img.window_token,))),
     )
     composite.meta = {  # type: ignore[attr-defined]
         "overlap_agreements": overlap_agreements,

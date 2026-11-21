@@ -9,7 +9,11 @@ from .model import UINT32, FloatImage
 
 
 def compare_images(a: FloatImage, b: FloatImage, tolerance: float = 0.0) -> dict:
-    """Pixel-level comparison restricted to the shared covered domain."""
+    """Pixel-level comparison restricted to the shared covered domain.
+
+    Channels are compared by ``source_name`` (logical identity), not dict
+    position, so a reordered store still matches the same logical channel.
+    """
     if a.data_window != b.data_window:
         raise AssertionError(f"data window mismatch: {a.data_window} != {b.data_window}")
     if a.display_window != b.display_window:
@@ -25,33 +29,43 @@ def compare_images(a: FloatImage, b: FloatImage, tolerance: float = 0.0) -> dict
         diff = np.argwhere(a.coverage != b.coverage)
         result["coverage_mismatch_count"] = int(len(diff))
 
-    for name in a.channels:
-        ca, cb = a.channels[name], b.channels[name]
-        entry: dict = {"dtype_a": ca.dtype, "dtype_b": cb.dtype}
+    a_by_source = {ch.descriptor.source_name: (name, ch) for name, ch in a.channels.items()}
+    b_by_source = {ch.descriptor.source_name: (name, ch) for name, ch in b.channels.items()}
+    result["channel_order_a"] = list(a.channels)
+    result["channel_order_b"] = list(b.channels)
+    result["logical_channels_equal"] = set(a_by_source) == set(b_by_source)
+
+    for source_name, (name, ca) in a_by_source.items():
+        if source_name not in b_by_source:
+            result["channels"][source_name] = {"present_b": False}
+            continue
+        _, cb = b_by_source[source_name]
+        entry: dict = {"name_a": name, "dtype_a": ca.dtype, "dtype_b": cb.dtype}
+        if ca.data.shape != cb.data.shape:
+            entry["shape_a"] = list(ca.data.shape)
+            entry["shape_b"] = list(cb.data.shape)
         if ca.dtype == UINT32 or cb.dtype == UINT32:
             entry["exact"] = bool(np.array_equal(ca.data, cb.data))
         else:
             fa, fb = ca.as_float32(), cb.as_float32()
-            valid = a.coverage & np.isfinite(fa) & np.isfinite(fb)
-            with np.errstate(invalid="ignore"):
-                abs_err = np.abs(fa - fb)
-            if valid.any():
-                denom = np.maximum(np.abs(fa), 1e-30)
-                entry.update(
-                    max_abs_error=float(abs_err[valid].max()),
-                    mean_abs_error=float(abs_err[valid].mean()),
-                    max_rel_error=float((abs_err[valid] / denom[valid]).max()),
-                    within_tolerance=bool(abs_err[valid].max() <= tolerance),
+            if fa.shape == fb.shape:
+                valid = a.coverage & np.isfinite(fa) & np.isfinite(fb)
+                with np.errstate(invalid="ignore"):
+                    abs_err = np.abs(fa - fb)
+                if valid.any():
+                    denom = np.maximum(np.abs(fa), 1e-30)
+                    entry.update(
+                        max_abs_error=float(abs_err[valid].max()),
+                        mean_abs_error=float(abs_err[valid].mean()),
+                        max_rel_error=float((abs_err[valid] / denom[valid]).max()),
+                        within_tolerance=bool(abs_err[valid].max() <= tolerance),
+                    )
+                entry["nan_preserved"] = bool(np.array_equal(np.isnan(fa), np.isnan(fb)))
+                entry["inf_sign_preserved"] = bool(
+                    np.array_equal(np.isposinf(fa), np.isposinf(fb))
+                    and np.array_equal(np.isneginf(fa), np.isneginf(fb))
                 )
-            # Non-finite handling must preserve the *kind* of failure.
-            entry["nan_preserved"] = bool(
-                np.array_equal(np.isnan(fa), np.isnan(fb))
-            )
-            entry["inf_sign_preserved"] = bool(
-                np.array_equal(np.isposinf(fa), np.isposinf(fb))
-                and np.array_equal(np.isneginf(fa), np.isneginf(fb))
-            )
-        result["channels"][name] = entry
+        result["channels"][source_name] = entry
     return result
 
 

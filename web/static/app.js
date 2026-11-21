@@ -214,3 +214,88 @@ $("#btn-acceptance").addEventListener("click", async () => {
 loadState().then(drawPreview).catch((err) => {
   $("#plates").innerHTML = `<span class="bad">加载失败: ${err.message}</span>`;
 });
+
+// --- depth occlusion, inspection, edit/undo, order swap -------------------
+state.inspectTarget = "depth";
+seg("#seg-inspect-target", "inspectTarget");
+
+function renderInspect(s) {
+  if (!s.inside) { $("#inspect-report").textContent = "该世界坐标不在数据窗内。"; return; }
+  const rows = Object.entries(s.channels).map(([n, v]) => {
+    const val = v.value === null ? "—" : v.value;
+    const flags = [v.semantic, v.role];
+    if (v.passthrough) flags.push("透传");
+    if (!v.present) flags.push(v.on_grid === false ? "窗内无样" : "缺采样");
+    return `<tr><td>${n}</td><td class="metric">${val}</td><td class="muted">${flags.join(" · ")}</td></tr>`;
+  }).join("");
+  $("#inspect-report").style.display = "block";
+  $("#inspect-report").innerHTML =
+    `<strong>世界坐标 (${s.world.join(", ")})</strong> · ${s.note} · token ${s.window_token}\n` +
+    `<table><tr><th>通道</th><th>原始值</th><th>语义 · 角色 · 状态</th></tr>${rows}</table>`;
+}
+
+$("#btn-inspect").addEventListener("click", async () => {
+  const x = $("#inspect-x").value, y = $("#inspect-y").value;
+  try {
+    const r = await getJSON(`/api/inspect?target=${state.inspectTarget}&x=${x}&y=${y}`);
+    renderInspect(r.sample);
+  } catch (err) { $("#inspect-report").textContent = err.message; }
+});
+
+$("#btn-depth").addEventListener("click", async () => {
+  try {
+    const r = await getJSON("/api/depth");
+    const p = r.provenance;
+    $("#depth-report").classList.remove("muted");
+    $("#depth-report").innerHTML =
+      `<strong>景深合成</strong> 数据窗 [${r.summary.data_window.join(", ")}]<br>` +
+      `前层胜出 ${p.foreground_pixels} · 后层胜出 ${p.background_pixels} · 缺样 ${p.missing_pixels}<br>` +
+      `深度来源 <code>${(r.depth_sources || []).join(", ")}</code> · 透传 <code>${(r.passthrough || []).join(", ")}</code>`;
+    state.inspectTarget = "depth";
+  } catch (err) { $("#depth-report").textContent = err.message; }
+});
+
+$("#btn-legacy").addEventListener("click", async () => {
+  try {
+    const r = await getJSON("/api/legacy");
+    $("#depth-report").classList.remove("muted");
+    $("#depth-report").innerHTML =
+      `<strong class="${r.all_passed ? "ok" : "bad"}">旧工程回归 ${r.checks.filter(c => c.passed).length}/${r.checks.length} 通过</strong>` +
+      `<div class="log" style="margin-top:6px">${r.checks.map(c => `${c.passed ? "✓" : "✗"} ${c.name}`).join("\n")}</div>`;
+  } catch (err) { $("#depth-report").textContent = err.message; }
+});
+
+$("#btn-edit").addEventListener("click", async () => {
+  try {
+    const r = await getJSON("/api/edit?action=apply&x=-5&y=0&size=4&value=1.5&base=Z");
+    $("#depth-report").innerHTML =
+      `<strong>前景局部编辑</strong> 区域 [${r.rect.join(", ")}] · 变更 <code>${JSON.stringify(r.changed)}</code> · 撤销栈 ${r.undo_depth}`;
+  } catch (err) { $("#depth-report").textContent = err.message; }
+});
+
+$("#btn-undo").addEventListener("click", async () => {
+  try {
+    const r = await getJSON("/api/edit?action=undo");
+    $("#depth-report").innerHTML = `<strong>已撤销</strong> · 撤销栈 ${r.undo_depth}`;
+  } catch (err) { $("#depth-report").textContent = err.message; }
+});
+
+$("#btn-order-swap").addEventListener("click", async () => {
+  try {
+    const r = await getJSON("/api/order?action=swap");
+    const allMatch = Object.values(r.logical_values_match).every(Boolean);
+    $("#depth-report").innerHTML =
+      `<strong>交换存储顺序</strong><br>请求顺序 <code>${r.requested_order.join(", ")}</code><br>` +
+      `文件顺序 <code>${r.stored_order.join(", ")}</code> · 顺序保持 ${r.order_preserved ? "是" : "否"}<br>` +
+      `逐通道逻辑值一致 <span class="${allMatch ? "ok" : "bad"}">${allMatch ? "是" : "否"}</span>` +
+      ` · <a href="/api/download?file=${r.download}"><button>下载 ${r.download}</button></a>`;
+  } catch (err) { $("#depth-report").textContent = err.message; }
+});
+
+$("#btn-crop").addEventListener("click", async () => {
+  try {
+    const r = await getJSON("/api/edit?action=crop&x0=-20&y0=-15&x1=20&y1=15");
+    $("#depth-report").innerHTML =
+      `<strong>裁切前景</strong> 数据窗 [${r.data_window.join(", ")}] · 尺寸 ${r.shape[1]}×${r.shape[0]}`;
+  } catch (err) { $("#depth-report").textContent = err.message; }
+});

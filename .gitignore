@@ -28,3 +28,6 @@ __pycache__/
 /work/acc_*.fim
 /work/acc_roundtrip.exr
 /work/export_*.fim
+/work/depth_fg.exr
+/work/depth_bg.exr
+/work/depth_composite.fim

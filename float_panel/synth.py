@@ -150,3 +150,136 @@ def write_plates(out_dir: str) -> tuple[str, str]:
         out.close()
         paths.append(path)
     return paths[0], paths[1]
+
+
+# ---------------------------------------------------------------------------
+# Depth-layer synth: one foreground plate and one background plate that share a
+# world window, each carrying its own depth/colour plus a foreground-only custom
+# channel layered *under* the depth component.  The custom channel is unknown
+# (pass-through only) and must never be handed downstream as depth.
+# ---------------------------------------------------------------------------
+
+DEPTH_WINDOW = (-30, -20, 29, 19)     # 60 x 40, negative origin
+DEPTH_FOREGROUND_Z = 6.0
+DEPTH_BACKGROUND_Z = 24.0
+# Where the foreground is *behind* the background, so background must win.
+FG_OCCLUDED_RECT = (0, -20, 14, 19)   # world x0, y0, x1, y1 in the right half
+
+
+def _depth_layer_arrays(role: str) -> dict:
+    x0, y0, x1, y1 = DEPTH_WINDOW
+    h, w = y1 - y0 + 1, x1 - x0 + 1
+    xs = np.arange(x0, x0 + w)[None, :]
+    ys = np.arange(y0, y0 + h)[:, None]
+    if role == "fg":
+        depth = np.full((h, w), DEPTH_FOREGROUND_Z, np.float32)
+        ox0, oy0, ox1, oy1 = FG_OCCLUDED_RECT
+        depth[(ys >= oy0) & (ys <= oy1) & (xs >= ox0) & (xs <= ox1)] = DEPTH_BACKGROUND_Z + 5.0
+        color = np.empty((h, w, 3), np.float32)
+        color[..., 0] = 0.85
+        color[..., 1] = 0.2
+        color[..., 2] = 0.2
+    else:
+        depth = np.full((h, w), DEPTH_BACKGROUND_Z, np.float32)
+        color = np.empty((h, w, 3), np.float32)
+        color[..., 0] = 0.1
+        color[..., 1] = 0.3
+        color[..., 2] = 0.8
+    # Foreground-only custom channel under the depth component: deliberately
+    # not depth-like in value, and includes a NaN, a negative and an exact zero
+    # so verbatim pass-through is observable.
+    custom = (xs.astype(np.float32) * 0.25 + ys.astype(np.float32) * 0.5) - 3.0
+    custom[0, 0] = np.nan
+    custom[1, 1] = 0.0
+    return {
+        "window": DEPTH_WINDOW,
+        "depth": np.ascontiguousarray(depth),
+        "custom": np.ascontiguousarray(custom.astype(np.float32)),
+        "R": np.ascontiguousarray(color[..., 0]),
+        "G": np.ascontiguousarray(color[..., 1]),
+        "B": np.ascontiguousarray(color[..., 2]),
+        "coverage": np.ones((h, w), np.uint32),
+    }
+
+
+def write_depth_plates(out_dir: str) -> tuple[str, str]:
+    """Write ``depth_fg.exr`` and ``depth_bg.exr`` with layered channel names.
+
+    The foreground names its depth ``fg.Z`` and its custom component
+    ``fg.Z.custom``; the background names its depth ``bg.Z``.  Split by final
+    component, both depth channels end in ``Z`` -- the same suffix, different
+    layers -- which is exactly the ambiguity the descriptor's role field
+    resolves.
+    """
+    fg = _depth_layer_arrays("fg")
+    bg = _depth_layer_arrays("bg")
+    specs = {
+        "depth_fg.exr": (fg, {
+            "fg.R": "R", "fg.G": "G", "fg.B": "B",
+            "fg.Z": "depth", "fg.Z.custom": "custom", "coverage": "coverage",
+        }),
+        "depth_bg.exr": (bg, {
+            "bg.R": "R", "bg.G": "G", "bg.B": "B",
+            "bg.Z": "depth", "coverage": "coverage",
+        }),
+    }
+    paths = []
+    for name, (plate, mapping) in specs.items():
+        h, w = _shape(plate["window"])
+        x0, y0, x1, y1 = plate["window"]
+        header = OpenEXR.Header(w, h)
+        header["dataWindow"] = Imath.Box2i(Imath.V2i(x0, y0), Imath.V2i(x1, y1))
+        header["displayWindow"] = Imath.Box2i(Imath.V2i(*DISPLAY[:2]), Imath.V2i(*DISPLAY[2:]))
+        header["channels"] = {}
+        payload = {}
+        for stored, key in mapping.items():
+            is_uint = key == "coverage"
+            header["channels"][stored] = Imath.Channel(
+                Imath.PixelType(Imath.PixelType.UINT if is_uint else Imath.PixelType.FLOAT))
+            payload[stored] = plate[key].tobytes()
+        path = os.path.join(out_dir, name)
+        out = OpenEXR.OutputFile(path, header)
+        out.writePixels(payload)
+        out.close()
+        paths.append(path)
+    return paths[0], paths[1]
+
+    # Special world positions chosen inside each plate's own window.
+    special_a = {
+        (-70, -50): "nan",
+        (-50, 15): "inf",
+        (-70, 10): "overflow",
+        (-60, -40): "neg",
+    }
+    special_b = {
+        (0, 0): "nan",
+        (20, 30): "inf",
+        (30, 50): "overflow",
+        (-5, 40): "neg",
+    }
+    a = _build_plate(WINDOW_A, 1, BLACK_POS, MISSING_POS, special_a,
+                     signed_strip_rows=(4, 10))
+    b = _build_plate(WINDOW_B, 7, MISSING_POS, BLACK_POS, special_b,
+                     signed_strip_rows=None)
+
+    paths = []
+    for plate, name in ((a, "plate_a.exr"), (b, "plate_b.exr")):
+        h, w = _shape(plate["window"])
+        x0, y0, x1, y1 = plate["window"]
+        header = OpenEXR.Header(w, h)
+        header["dataWindow"] = Imath.Box2i(Imath.V2i(x0, y0), Imath.V2i(x1, y1))
+        header["displayWindow"] = Imath.Box2i(Imath.V2i(*DISPLAY[:2]), Imath.V2i(*DISPLAY[2:]))
+        header["channels"] = {
+            "R": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+            "G": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+            "B": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+            "Z": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+            "customHeat": Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+            "coverage": Imath.Channel(Imath.PixelType(Imath.PixelType.UINT)),
+        }
+        path = os.path.join(out_dir, name)
+        out = OpenEXR.OutputFile(path, header)
+        out.writePixels({k: v.tobytes() for k, v in plate.items() if k != "window"})
+        out.close()
+        paths.append(path)
+    return paths[0], paths[1]
